@@ -3,23 +3,29 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const auth = require('../middleware/authMiddleware');
 
-// GET /api/orders
-// - Customer & Admin: see all orders (admin can also filter by status)
-// - Wholesaler: see only orders assigned to them, optional status filter
-// - Rider: see only orders assigned to them, or use /available-for-pickup
+// ========== GET /api/orders ==========
+// - Customer: see own orders
+// - Wholesaler: see orders assigned to them, optional status filter
+// - Rider: see orders assigned to them
+// - Admin: see all orders
 router.get('/', auth, async (req, res) => {
   try {
     const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'customer') {
+      query.customer = req.user.id;
+    }
 
     if (req.user.role === 'wholesaler') {
       query.wholesaler = req.user.id;
     }
 
     if (req.user.role === 'rider') {
-      // Rider can see orders assigned to them
       query.rider = req.user.id;
     }
 
+    // Optional status filter (comma-separated: pending,accepted)
     if (req.query.status) {
       const statuses = req.query.status.split(',');
       query.status = { $in: statuses };
@@ -27,158 +33,351 @@ router.get('/', auth, async (req, res) => {
 
     const orders = await Order.find(query)
       .populate('customer', 'name phone')
-      .populate('wholesaler', 'name address phone')
-      .populate('items.product', 'name price')
-      .populate('rider', 'name phone')
+      .populate('wholesaler', 'name address phone location')
+      .populate('items.product', 'name price image')
+      .populate('rider', 'name phone vehicleNumber')
       .sort({ createdAt: -1 });
 
     res.json(orders);
   } catch (err) {
+    console.error('Get orders error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/orders/available-for-pickup   (Rider sees orders ready for pickup)
+// ========== GET /api/orders/available-for-pickup ==========
+// - Rider: see orders that are ready for pickup and unassigned
 router.get('/available-for-pickup', auth, async (req, res) => {
   if (req.user.role !== 'rider') {
-    return res.status(403).json({ message: 'Access denied' });
+    return res.status(403).json({ message: 'Access denied. Riders only.' });
   }
   try {
-    const orders = await Order.find({ status: 'ready_for_pickup', rider: null })
-      .populate('wholesaler', 'name address phone')
-      .populate('customer', 'name phone address');
+    const orders = await Order.find({
+      status: 'ready_for_pickup',
+      rider: null
+    })
+      .populate('wholesaler', 'name address phone location')
+      .populate('customer', 'name phone')
+      .populate('items.product', 'name price')
+      .sort({ createdAt: -1 });
+
     res.json(orders);
   } catch (err) {
+    console.error('Get available orders error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/orders/:id   (single order detail — any authenticated user, with ownership check)
+// ========== GET /api/orders/:id ==========
+// - Any authenticated user can see single order (ownership checked below)
 router.get('/:id', auth, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
       .populate('customer', 'name phone')
-      .populate('wholesaler', 'name address')
-      .populate('items.product', 'name price')
-      .populate('rider', 'name phone');
+      .populate('wholesaler', 'name address phone location')
+      .populate('items.product', 'name price image')
+      .populate('rider', 'name phone vehicleNumber');
 
-    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
 
-    // Basic ownership check (optional, can be refined)
-    if (
-      req.user.role === 'customer' && order.customer?.toString() !== req.user.id ||
-      req.user.role === 'wholesaler' && order.wholesaler?.toString() !== req.user.id ||
-      req.user.role === 'rider' && order.rider?.toString() !== req.user.id
-    ) {
-      // Allow if they are admin (for simplicity, skip strict check for now)
+    // Ownership check (skip for admin)
+    if (req.user.role === 'customer' && order.customer?._id?.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    if (req.user.role === 'wholesaler' && order.wholesaler?._id?.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    if (req.user.role === 'rider' && order.rider?._id?.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
     res.json(order);
   } catch (err) {
+    console.error('Get order error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/orders   (Customer creates a new order)
+// ========== POST /api/orders ==========
+// - Customer: create new order
 router.post('/', auth, async (req, res) => {
   try {
-    const { items, address, location, paymentMethod, wholesalerId } = req.body;
+    const { items, address, location, paymentMethod, wholesalerId, customerNotes } = req.body;
+
+    // Validate required fields
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'Items are required' });
+    }
+    if (!address) {
+      return res.status(400).json({ message: 'Delivery address is required' });
+    }
+    if (!wholesalerId) {
+      return res.status(400).json({ message: 'Wholesaler is required' });
+    }
+
     let totalAmount = 0;
+    const orderItems = [];
 
     // Validate stock and lock prices
     for (let item of items) {
       const product = await Product.findById(item.product);
-      if (!product || product.stock < item.quantity) {
-        return res.status(400).json({ message: `${product?.name || 'Product'} out of stock` });
+      
+      if (!product) {
+        return res.status(404).json({ message: `Product not found: ${item.product}` });
       }
-      totalAmount += product.price * item.quantity;
-      item.price = product.price; // freeze price at order time
+      
+      if (!product.isAvailable) {
+        return res.status(400).json({ message: `${product.name} is currently unavailable` });
+      }
+      
+      if (product.stock < item.quantity) {
+        return res.status(400).json({ 
+          message: `Only ${product.stock} units of ${product.name} available` 
+        });
+      }
+
+      const itemTotal = product.price * item.quantity;
+      totalAmount += itemTotal;
+
+      orderItems.push({
+        product: product._id,
+        quantity: item.quantity,
+        price: product.price // Lock price at order time
+      });
     }
 
-    const otp = Math.floor(1000 + Math.random() * 9000).toString(); // 4-digit OTP
+    // Generate 4-digit OTP for delivery confirmation
+    const otp = Math.floor(1000 + Math.random() * 9000).toString();
 
+    // Create the order (orderNumber is auto-generated by the model's pre-save hook)
     const order = new Order({
       customer: req.user.id,
       wholesaler: wholesalerId,
-      items,
+      items: orderItems,
       totalAmount,
       deliveryAddress: address,
       location: {
         type: 'Point',
-        coordinates: [location.lng, location.lat]
+        coordinates: location ? [location.lng, location.lat] : [0, 0]
       },
       paymentMethod: paymentMethod || 'cod',
+      customerNotes: customerNotes || '',
       otp
     });
 
     await order.save();
 
-    // Decrease stock
+    // Decrease stock for each product
     for (let item of items) {
       await Product.findByIdAndUpdate(item.product, {
         $inc: { stock: -item.quantity }
       });
     }
 
+    // Populate the order before sending response and socket event
+    const populatedOrder = await Order.findById(order._id)
+      .populate('customer', 'name phone')
+      .populate('wholesaler', 'name address phone')
+      .populate('items.product', 'name price');
+
     // Notify wholesaler via Socket.io
     const io = req.app.get('io');
-    io.to(order.wholesaler.toString()).emit('newOrder', order);
+    if (io) {
+      io.to(wholesalerId).emit('newOrder', populatedOrder);
+      console.log(`📢 New order #${order.orderNumber} sent to wholesaler ${wholesalerId}`);
+    }
 
-    res.status(201).json(order);
+    res.status(201).json(populatedOrder);
   } catch (err) {
+    console.error('Create order error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// PATCH /api/orders/:id/status   (Update order status by any authorized role)
+// ========== PATCH /api/orders/:id/status ==========
+// - Update order status by authorized roles
 router.patch('/:id/status', auth, async (req, res) => {
   try {
     const { status, riderId } = req.body;
     const order = await Order.findById(req.params.id);
 
-    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
 
-    // Role-based status progression logic (simplified)
+    // Define valid status transitions per role
+    const wholesalerTransitions = {
+      'pending': 'accepted',
+      'accepted': 'preparing',
+      'preparing': 'ready_for_pickup',
+      'ready_for_pickup': 'ready_for_pickup' // can't go further
+    };
+
+    const riderTransitions = {
+      'ready_for_pickup': 'picked_up',
+      'picked_up': 'delivered'
+    };
+
+    const adminTransitions = {
+      // Admin can set any status
+      'pending': 'accepted',
+      'accepted': 'preparing',
+      'preparing': 'ready_for_pickup',
+      'ready_for_pickup': 'picked_up',
+      'picked_up': 'delivered',
+      // And cancellations
+      'pending': 'cancelled',
+      'accepted': 'cancelled',
+      'preparing': 'cancelled'
+    };
+
+    // Role-based validation
     if (req.user.role === 'wholesaler') {
-      // Wholesaler can only transition: pending -> accepted, accepted -> preparing, preparing -> ready_for_pickup
-      const allowedTransitions = {
-        pending: 'accepted',
-        accepted: 'preparing',
-        preparing: 'ready_for_pickup'
-      };
-      if (allowedTransitions[order.status] !== status) {
-        return res.status(400).json({ message: 'Invalid status transition for wholesaler' });
+      // Wholesaler can only update their own orders
+      if (order.wholesaler.toString() !== req.user.id) {
+        return res.status(403).json({ message: 'Not your order' });
+      }
+      
+      const allowedTransition = wholesalerTransitions[order.status];
+      if (allowedTransition !== status) {
+        return res.status(400).json({ 
+          message: `Cannot change status from '${order.status}' to '${status}'` 
+        });
       }
     }
 
     if (req.user.role === 'rider') {
-      // Rider can mark picked_up, delivered (and maybe after picking up from ready_for_pickup)
-      if (status === 'picked_up' && order.status === 'ready_for_pickup') {
+      const allowedTransition = riderTransitions[order.status];
+      if (allowedTransition !== status) {
+        return res.status(400).json({ 
+          message: `Cannot change status from '${order.status}' to '${status}'` 
+        });
+      }
+      
+      // Riders assign themselves when picking up
+      if (status === 'picked_up') {
         order.rider = req.user.id;
-      } else if (status === 'delivered' && order.status === 'picked_up') {
-        // delivered
-      } else {
-        return res.status(400).json({ message: 'Invalid status transition for rider' });
       }
     }
 
-    if (req.user.role === 'admin') {
-      // Admin can set any status
+    if (req.user.role === 'customer') {
+      return res.status(403).json({ message: 'Customers cannot change order status' });
     }
 
+    // Admin can set rider manually
+    if (req.user.role === 'admin' && riderId) {
+      order.rider = riderId;
+    }
+
+    // Update status
     order.status = status;
-    if (riderId) order.rider = riderId;
+
+    // If delivered, the pre-save hook will set actualDeliveryTime and paymentStatus
     await order.save();
 
-    // Emit status update to customer's order room
-    const io = req.app.get('io');
-    io.to(order._id.toString()).emit('orderStatusChanged', {
-      orderId: order._id,
-      status: order.status
-    });
+    // Populate the updated order
+    const updatedOrder = await Order.findById(order._id)
+      .populate('customer', 'name phone')
+      .populate('wholesaler', 'name address')
+      .populate('items.product', 'name price')
+      .populate('rider', 'name phone');
 
-    res.json(order);
+    // Emit status update via Socket.io to the order room (customer tracking)
+    const io = req.app.get('io');
+    if (io) {
+      io.to(order._id.toString()).emit('orderStatusChanged', {
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        status: order.status
+      });
+
+      // Also notify the wholesaler
+      io.to(order.wholesaler.toString()).emit('orderUpdated', updatedOrder);
+
+      console.log(`📢 Order #${order.orderNumber} status changed to '${order.status}'`);
+    }
+
+    res.json(updatedOrder);
   } catch (err) {
+    console.error('Update order status error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== PATCH /api/orders/:id/cancel ==========
+// - Cancel an order (customer can cancel if pending, admin can cancel anytime)
+router.patch('/:id/cancel', auth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // Only customer (their own order) or admin can cancel
+    if (req.user.role === 'customer' && order.customer.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Not your order' });
+    }
+
+    // Customer can only cancel if order is pending or accepted
+    if (req.user.role === 'customer' && !['pending', 'accepted'].includes(order.status)) {
+      return res.status(400).json({ 
+        message: 'Order can only be cancelled when pending or accepted' 
+      });
+    }
+
+    // Restore stock
+    for (let item of order.items) {
+      await Product.findByIdAndUpdate(item.product, {
+        $inc: { stock: item.quantity }
+      });
+    }
+
+    order.status = 'cancelled';
+    await order.save();
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(order._id.toString()).emit('orderStatusChanged', {
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        status: 'cancelled'
+      });
+    }
+
+    res.json({ message: 'Order cancelled', order });
+  } catch (err) {
+    console.error('Cancel order error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== PATCH /api/orders/:id/otp-verify ==========
+// - Verify delivery OTP (rider submits OTP to confirm delivery)
+router.patch('/:id/otp-verify', auth, async (req, res) => {
+  try {
+    const { otp } = req.body;
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    if (req.user.role !== 'rider') {
+      return res.status(403).json({ message: 'Only riders can verify OTP' });
+    }
+
+    if (order.otp !== otp) {
+      return res.status(400).json({ message: 'Invalid OTP' });
+    }
+
+    // OTP is correct, but status change should happen separately
+    // This route just confirms the OTP is valid
+    res.json({ message: 'OTP verified successfully', valid: true });
+  } catch (err) {
+    console.error('OTP verify error:', err);
     res.status(500).json({ error: err.message });
   }
 });
